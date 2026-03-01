@@ -263,7 +263,7 @@ divan = "0.1"
 
 # misc
 auto_impl = "1"
-bytes = "1.8"
+bytes = "1.11"
 walkdir = "2"
 prettyplease = "0.2"
 base64 = "0.22"

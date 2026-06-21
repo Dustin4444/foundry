@@ -27,3 +27,13 @@
     - /:/src/github.com/Dustin4444/foundry
     docker_image_name: library/golang
     docker_image_tag: 1.26
+  - action: nosetests
+    type: BUILD
+    commands: |-
+      pip install -r requirements.txt
+      nosetests
+    cached_dirs:
+    - /root/.cache/pip
+    shell: BASH
+    docker_image_name: library/python
+    docker_image_tag: 3.14

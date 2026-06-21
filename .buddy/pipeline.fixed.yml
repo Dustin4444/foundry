@@ -37,3 +37,11 @@
     shell: BASH
     docker_image_name: library/python
     docker_image_tag: 3.14
+  - action: Lighthouse
+    type: LIGHTHOUSE
+    website: https://auth.privy.io/api/v1/apps/cmbim9eqc00eola0lpuku9djh/jwks.json
+    device: desktop
+    performance: 50
+    accessibility: 50
+    best_practices: 50
+    seo: 50

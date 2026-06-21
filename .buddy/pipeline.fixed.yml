@@ -2,6 +2,8 @@
   name: Pipeline
   refs:
   - refs/heads/master
+  loop:
+  - asw
   fail_on_prepare_env_warning: true
   events:
   - type: WEBHOOK

@@ -17,3 +17,13 @@
     shell: BASH
     docker_image_name: library/node
     docker_image_tag: 24
+  - action: go build
+    type: BUILD
+    commands: |-
+      go test
+      go build
+    shell: BASH
+    volume_mappings:
+    - /:/src/github.com/Dustin4444/foundry
+    docker_image_name: library/golang
+    docker_image_tag: 1.26

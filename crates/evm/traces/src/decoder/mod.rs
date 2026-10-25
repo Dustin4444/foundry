@@ -443,7 +443,7 @@ impl CallTraceDecoder {
 
         let functions = console::hh::abi::functions()
             .into_values()
-            .chain([vm::functions()])
+            .chain(vm::functions())
             .chain(IFeeManager::abi::functions().into_values())
             // `IStorageCredits` shares the `balanceOf(address)` selector with `ITIP20`, so it
             // must be chained first to keep `ITIP20`'s `uint256` return as the global fallback.

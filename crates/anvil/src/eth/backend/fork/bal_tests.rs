@@ -12,7 +12,7 @@ use alloy_provider::ProviderBuilder;
 use alloy_rpc_types::Block;
 use alloy_transport::mock::Asserter;
 use foundry_evm::{backend::BlockchainDbMeta, hardfork::EthereumHardfork};
-use futures::executor::block_on;
+use tokio::runtime::Runtime;
 use revm::{context::BlockEnv, state::AccountInfo};
 use std::{
     sync::{
@@ -394,10 +394,11 @@ fn fork_cached_block_reads_do_not_deadlock_with_writers() {
     };
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
+        let rt = Runtime::new().unwrap();
         for _ in 0..10_000 {
-            assert!(block_on(fork.block_by_number(1)).unwrap().is_some());
-            assert!(block_on(fork.block_by_number_full(1)).unwrap().is_some());
-            assert!(block_on(fork.block_by_hash_full(hash)).unwrap().is_some());
+            assert!(rt.block_on(fork.block_by_number(1)).unwrap().is_some());
+            assert!(rt.block_on(fork.block_by_number_full(1)).unwrap().is_some());
+            assert!(rt.block_on(fork.block_by_hash_full(hash)).unwrap().is_some());
         }
         tx.send(()).unwrap();
     });

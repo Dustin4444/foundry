@@ -1111,7 +1111,7 @@ impl CallTraceDecoder {
             // Check if unsupported fn selector: calldata dooes NOT point to one of its selectors +
             // non-fallback contract + no receive. Skip delegate calls: library ABIs omit external
             // functions with storage parameters.
-            if !trace.kind.is_delegate()
+            if !matches!(trace.kind, revm_inspectors::tracing::types::CallKind::DelegateCall)
                 && let Some(contract_selectors) = self.non_fallback_contracts.get(&trace.address)
                 && !contract_selectors.contains(&selector)
                 && (!cdata.is_empty() || !self.receive_contracts.contains(&trace.address))

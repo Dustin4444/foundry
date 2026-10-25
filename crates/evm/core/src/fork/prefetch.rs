@@ -76,8 +76,8 @@ pub(crate) fn spawn<N: Network, B: ForkBlockEnv>(
                         let Some(key) = keys.lock().next() else { break };
                         // A prefetched key stays out of the cache file until the EVM reads it.
                         let read = match key {
-                            Key::Account(address) => backend.prefetch_basic(address),
-                            Key::Slot(address, slot) => backend.prefetch_storage(address, slot),
+                            Key::Account(address) => backend.basic_ref(address),
+                            Key::Slot(address, slot) => backend.storage_ref(address, slot),
                         };
                         // The EVM fetches any key it still needs, so stop at the first failure.
                         if read.is_err() {

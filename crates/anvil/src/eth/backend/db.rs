@@ -67,7 +67,7 @@ pub(crate) fn cache_block_hash(block_hashes: &mut U256Map<B256>, number: U256, h
 }
 
 /// Helper trait get access to the full state data of the database
-pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
+pub trait MaybeFullDatabase: crate::mem::DatabaseRef + Send + Sync {
     fn maybe_as_full_db(&self) -> Option<&AddressMap<DbAccount>> {
         None
     }
@@ -100,6 +100,9 @@ pub trait MaybeFullDatabase: DatabaseRef<Error = DatabaseError> + Debug {
     /// Reverses `clear_into_snapshot` by initializing the db's state with the state snapshot.
     fn init_from_state_snapshot(&mut self, state_snapshot: StateSnapshot);
 }
+
+/// A borrowed, type-erased state that overlays are built on, so that EVMs are monomorphized once.
+pub type StateRef<'a> = &'a dyn MaybeFullDatabase;
 
 impl<'a, T: 'a + MaybeFullDatabase + ?Sized> MaybeFullDatabase for &'a T
 where
@@ -186,7 +189,7 @@ pub struct AnvilCacheDB<T>(pub CacheDB<T>, BalState, SpecId);
 
 impl<T: DatabaseRef<Error = DatabaseError>> AnvilCacheDB<T> {
     pub fn new(inner: T, spec: SpecId) -> Self {
-        Self(CacheDB::new(inner), BalState::default(), spec)
+        Self(CacheDB::new(inner), BalState::new(), spec)
     }
 
     /// Enables EIP-7928 block access list recording.
@@ -282,14 +285,42 @@ impl<T: DatabaseRef<Error = DatabaseError> + fmt::Debug> BalIndexedDatabase
     }
 }
 
+/// A read-only view of a database that reports empty accounts as absent.
+///
+/// Anvil's databases return a default [`AccountInfo`] for an account they don't hold (see
+/// [`EmptyDBWrapper`]), so an absent account can't be told apart from an empty one. Since
+/// EIP-161 an empty account can't be created and is deleted when touched, so this view lets a
+/// pre-state lookup treat both as absent. An account that already exists while empty, from genesis
+/// or before Spurious Dragon, is also reported as absent.
+#[derive(Debug)]
+pub(super) struct EmptyAsAbsentDb<T>(pub(super) T);
+
+impl<T: DatabaseRef> DatabaseRef for EmptyAsAbsentDb<T> {
+    type Error = T::Error;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        Ok(self.0.basic_ref(address)?.filter(|info| !info.is_empty()))
+    }
+
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.0.code_by_hash_ref(code_hash)
+    }
+
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        self.0.storage_ref(address, index)
+    }
+
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        self.0.block_hash_ref(number)
+    }
+}
+
 /// This bundles all required revm traits
 pub trait Db:
-    DatabaseRef<Error = DatabaseError>
-    + Database<Error = DatabaseError>
+    Database<Error = DatabaseError>
     + DatabaseCommit
     + MaybeFullDatabase
     + MaybeForkedDatabase
-    + fmt::Debug
     + Send
     + Sync
 {
@@ -348,10 +379,8 @@ pub trait Db:
     /// Deserialize and add all accounts to the backend storage.
     fn load_state(&mut self, state: SerializableState) -> DatabaseResult<bool> {
         for (addr, account) in state.accounts {
-            let old_account_nonce = DatabaseRef::basic_ref(self, addr)
-                .ok()
-                .and_then(|acc| acc.map(|acc| acc.nonce))
-                .unwrap_or_default();
+            let old_account_nonce =
+                DatabaseRef::basic_ref(self, addr)?.map(|acc| acc.nonce).unwrap_or_default();
             // use max nonce in case account is imported multiple times with difference
             // nonces to prevent collisions
             let nonce = std::cmp::max(old_account_nonce, account.nonce);
@@ -386,6 +415,9 @@ pub trait Db:
     /// Returns `true` if the state snapshot was reverted.
     fn revert_state(&mut self, state_snapshot: U256, action: RevertStateSnapshotAction) -> bool;
 
+    /// Deletes a state snapshot without reverting it.
+    fn delete_state_snapshot(&mut self, state_snapshot: U256) -> bool;
+
     /// Returns the state root if possible to compute
     fn maybe_state_root(&self) -> Option<B256> {
         None
@@ -393,6 +425,13 @@ pub trait Db:
 
     /// Returns the current, standalone state of the Db
     fn current_state(&self) -> StateDb;
+
+    /// Rebuilds a historical state from a serialized state snapshot.
+    fn historical_state(&self, state_snapshot: StateSnapshot) -> StateDb {
+        let mut state = StateDb::new(MemDb::default());
+        state.init_from_state_snapshot(state_snapshot);
+        state
+    }
 }
 
 /// Convenience impl only used to use any `Db` on the fly as the db layer for revm's CacheDB
@@ -438,6 +477,10 @@ where
         false
     }
 
+    fn delete_state_snapshot(&mut self, _state_snapshot: U256) -> bool {
+        false
+    }
+
     fn maybe_state_root(&self) -> Option<B256> {
         self.maybe_full_db().map(|accounts| crate::mem::state::state_root(&accounts))
     }
@@ -459,7 +502,7 @@ impl<T: MaybeFullDatabase> MaybeFullDatabase for CacheDB<T> {
                 accounts.remove(address);
                 continue;
             }
-            if overlay.account_state == AccountState::StorageCleared {
+            if overlay.account_state.is_storage_cleared() {
                 accounts.insert(*address, overlay.clone());
                 continue;
             }
@@ -477,30 +520,50 @@ impl<T: MaybeFullDatabase> MaybeFullDatabase for CacheDB<T> {
         let db_accounts = std::mem::take(&mut self.cache.accounts);
         let mut accounts = HashMap::default();
         let mut account_storage = HashMap::default();
+        let mut account_states = HashMap::default();
 
         for (addr, mut acc) in db_accounts {
             account_storage.insert(addr, std::mem::take(&mut acc.storage));
+            if matches!(acc.account_state, AccountState::NotExisting | AccountState::StorageCleared)
+            {
+                account_states.insert(addr, acc.account_state);
+            }
             let mut info = acc.info;
-            info.code = self.cache.contracts.remove(&info.code_hash);
+            info.code = self.cache.contracts.remove(&info.code_hash());
             accounts.insert(addr, info);
         }
         let block_hashes = std::mem::take(&mut self.cache.block_hashes);
-        StateSnapshot { accounts, storage: account_storage, block_hashes }
+        StateSnapshot {
+            accounts,
+            storage: account_storage,
+            block_hashes,
+            account_states: Some(account_states),
+        }
     }
 
     fn read_as_state_snapshot(&self) -> StateSnapshot {
         let mut accounts = HashMap::default();
         let mut account_storage = HashMap::default();
+        let mut account_states = HashMap::default();
 
         for (addr, acc) in &self.cache.accounts {
             account_storage.insert(*addr, acc.storage.clone());
+            if matches!(acc.account_state, AccountState::NotExisting | AccountState::StorageCleared)
+            {
+                account_states.insert(*addr, acc.account_state.clone());
+            }
             let mut info = acc.info.clone();
-            info.code = self.cache.contracts.get(&info.code_hash).cloned();
+            info.code = self.cache.contracts.get(&info.code_hash()).cloned();
             accounts.insert(*addr, info);
         }
 
         let block_hashes = self.cache.block_hashes.clone();
-        StateSnapshot { accounts, storage: account_storage, block_hashes }
+        StateSnapshot {
+            accounts,
+            storage: account_storage,
+            block_hashes,
+            account_states: Some(account_states),
+        }
     }
 
     fn clear(&mut self) {
@@ -508,18 +571,19 @@ impl<T: MaybeFullDatabase> MaybeFullDatabase for CacheDB<T> {
     }
 
     fn init_from_state_snapshot(&mut self, state_snapshot: StateSnapshot) {
-        let StateSnapshot { accounts, mut storage, block_hashes } = state_snapshot;
+        let StateSnapshot { accounts, mut storage, block_hashes, account_states } = state_snapshot;
+        let mut account_states = account_states.unwrap_or_default();
 
         for (addr, mut acc) in accounts {
             if let Some(code) = acc.code.take() {
-                self.cache.contracts.insert(acc.code_hash, code);
+                self.cache.contracts.insert(acc.code_hash(), code);
             }
             self.cache.accounts.insert(
                 addr,
                 DbAccount {
                     info: acc,
+                    account_state: account_states.remove(&addr).unwrap_or_default(),
                     storage: storage.remove(&addr).unwrap_or_default(),
-                    ..Default::default()
                 },
             );
         }
@@ -557,10 +621,10 @@ impl<T: DatabaseRef<Error = DatabaseError>> MaybeForkedDatabase for CacheDB<T> {
 
 /// Represents a state at certain point
 #[derive(Debug)]
-pub struct StateDb(pub(crate) Box<dyn MaybeFullDatabase + Send + Sync>);
+pub struct StateDb(pub(crate) Box<dyn MaybeFullDatabase>);
 
 impl StateDb {
-    pub fn new(db: impl MaybeFullDatabase + Send + Sync + 'static) -> Self {
+    pub fn new(db: impl MaybeFullDatabase + 'static) -> Self {
         Self(Box::new(db))
     }
 
@@ -949,7 +1013,12 @@ impl IntoIterator for SerializableHistoricalStates {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::eth::backend::mem::fork_db::ForkedDatabase;
     use alloy_consensus::Header;
+    use alloy_network::AnyNetwork;
+    use alloy_provider::ProviderBuilder;
+    use alloy_transport::mock::Asserter;
+    use foundry_evm::backend::{BlockchainDbMeta, SharedBackend};
     use std::fs;
 
     #[test]
@@ -980,26 +1049,23 @@ mod test {
         let updated = Address::with_last_byte(2);
         let deleted = Address::with_last_byte(3);
         let cleared = Address::with_last_byte(4);
-        let deleted_slot = U256::from(1);
+        let deleted_slot = U256::ONE;
         let updated_slot = U256::from(2);
 
         let mut base = MemDb::default();
-        base.insert_account(preserved, AccountInfo::from_balance(U256::from(1)));
+        base.insert_account(preserved, AccountInfo::from_balance(U256::ONE));
         base.insert_account(updated, AccountInfo::from_balance(U256::from(2)));
-        base.set_storage_at(updated, deleted_slot.into(), B256::from(U256::from(10))).unwrap();
-        base.set_storage_at(updated, updated_slot.into(), B256::from(U256::from(11))).unwrap();
+        base.set_storage_at(updated, deleted_slot.into(), B256::with_last_byte(10)).unwrap();
+        base.set_storage_at(updated, updated_slot.into(), B256::with_last_byte(11)).unwrap();
         base.insert_account(deleted, AccountInfo::from_balance(U256::from(3)));
         base.insert_account(cleared, AccountInfo::from_balance(U256::from(4)));
-        base.set_storage_at(cleared, deleted_slot.into(), B256::from(U256::from(11))).unwrap();
+        base.set_storage_at(cleared, deleted_slot.into(), B256::with_last_byte(11)).unwrap();
 
         let mut cache = CacheDB::new(base);
         cache.insert_account_info(updated, AccountInfo::from_balance(U256::from(20)));
         cache.insert_account_storage(updated, deleted_slot, U256::ZERO).unwrap();
         cache.insert_account_storage(updated, updated_slot, U256::from(12)).unwrap();
-        cache.cache.accounts.insert(
-            deleted,
-            DbAccount { account_state: AccountState::NotExisting, ..Default::default() },
-        );
+        cache.cache.accounts.insert(deleted, DbAccount::new_not_existing());
         cache.cache.accounts.insert(
             cleared,
             DbAccount {
@@ -1010,7 +1076,7 @@ mod test {
         );
 
         let accounts = cache.maybe_full_db().unwrap();
-        assert_eq!(accounts[&preserved].info.balance, U256::from(1));
+        assert_eq!(accounts[&preserved].info.balance, U256::ONE);
         assert_eq!(accounts[&updated].info.balance, U256::from(20));
         assert_eq!(accounts[&updated].storage[&deleted_slot], U256::ZERO);
         assert_eq!(accounts[&updated].storage[&updated_slot], U256::from(12));
@@ -1022,6 +1088,49 @@ mod test {
             cache.maybe_full_db().map(|accounts| crate::mem::state::state_root(&accounts)),
             Some(crate::mem::state::state_root(&expected))
         );
+    }
+
+    #[test]
+    fn cache_db_state_snapshot_preserves_account_states() {
+        let touched = Address::with_last_byte(1);
+        let deleted = Address::with_last_byte(2);
+        let cleared = Address::with_last_byte(3);
+        let (kept_slot, missing_slot) = (U256::ONE, U256::from(2));
+        // The base stands in for a fork whose storage must not leak into cleared accounts.
+        let base = || {
+            let mut base = MemDb::default();
+            for address in [touched, deleted, cleared] {
+                base.insert_account(address, AccountInfo::from_balance(U256::ONE));
+                base.set_storage_at(address, missing_slot.into(), B256::with_last_byte(9)).unwrap();
+            }
+            base
+        };
+
+        let mut cache = CacheDB::new(base());
+        cache.insert_account_storage(touched, kept_slot, U256::from(5)).unwrap();
+        cache.cache.accounts.insert(deleted, DbAccount::new_not_existing());
+        let mut cleared_account = DbAccount {
+            info: AccountInfo::from_balance(U256::from(40)),
+            account_state: AccountState::StorageCleared,
+            ..Default::default()
+        };
+        cleared_account.storage.insert(kept_slot, U256::from(6));
+        cache.cache.accounts.insert(cleared, cleared_account);
+
+        let snapshot = cache.read_as_state_snapshot();
+        let mut restored = CacheDB::new(base());
+        restored.init_from_state_snapshot(
+            serde_json::from_str(&serde_json::to_string(&snapshot).unwrap()).unwrap(),
+        );
+
+        assert_eq!(restored.storage_ref(touched, kept_slot).unwrap(), U256::from(5));
+        assert_eq!(restored.storage_ref(touched, missing_slot).unwrap(), U256::from(9));
+        assert_eq!(restored.basic_ref(deleted).unwrap(), None);
+        assert_eq!(restored.storage_ref(deleted, missing_slot).unwrap(), U256::ZERO);
+        assert_eq!(restored.basic_ref(cleared).unwrap().unwrap().balance, U256::from(40));
+        assert_eq!(restored.storage_ref(cleared, kept_slot).unwrap(), U256::from(6));
+        assert_eq!(restored.storage_ref(cleared, missing_slot).unwrap(), U256::ZERO);
+        assert_eq!(restored.clear_into_state_snapshot().account_states, snapshot.account_states);
     }
 
     #[test]
@@ -1102,5 +1211,47 @@ mod test {
         assert_eq!(withdrawals.len(), 1);
         assert_eq!(withdrawals[0].index, 42);
         assert_eq!(withdrawals[0].validator_index, 123);
+    }
+
+    #[test]
+    fn load_state_fork_read_error_allows_snapshot_rollback() {
+        let provider =
+            ProviderBuilder::<_, _, AnyNetwork>::default().connect_mocked_client(Asserter::new());
+        let remote = BlockchainDb::new(
+            BlockchainDbMeta::new(BlockEnv::default(), "http://localhost".to_string()),
+            None,
+        );
+        let (backend, handler) = SharedBackend::new(provider, remote.clone(), None);
+        drop(handler);
+        let mut db = ForkedDatabase::new(backend, remote);
+        let cached = Address::with_last_byte(1);
+        let uncached = Address::with_last_byte(2);
+        let original = AccountInfo { nonce: 7, balance: U256::ONE, ..Default::default() };
+        db.insert_account(cached, original.clone());
+        let snapshot = db.snapshot_state();
+        let mut state = SerializableState::default();
+        for address in [cached, uncached] {
+            state.accounts.insert(
+                address,
+                SerializableAccountRecord {
+                    nonce: 3,
+                    balance: U256::from(10),
+                    code: Bytes::new(),
+                    storage: Default::default(),
+                },
+            );
+        }
+
+        // The cached account imports first; the next lookup reaches the closed fork backend.
+        assert!(matches!(db.load_state(state), Err(DatabaseError::Send(_))));
+        let imported = db.basic_ref(cached).unwrap().unwrap();
+        assert_eq!(imported.nonce, original.nonce);
+        assert_eq!(imported.balance, U256::from(10));
+        assert!(!db.database().cache.accounts.contains_key(&uncached));
+
+        // Mirror Backend::load_state's error path and restore the earlier partial import.
+        assert!(db.revert_state(snapshot, RevertStateSnapshotAction::RevertRemove));
+        assert_eq!(db.basic_ref(cached).unwrap().unwrap(), original);
+        assert!(!db.database().cache.accounts.contains_key(&uncached));
     }
 }

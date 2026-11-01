@@ -1,7 +1,10 @@
 use crate::{
     AccountGenerator, CHAIN_ID, NodeConfig,
-    config::{DEFAULT_MNEMONIC, DEFAULT_SLOTS_IN_AN_EPOCH, ForkChoice},
-    eth::{EthApi, backend::db::SerializableState, pool::transactions::TransactionOrder},
+    config::{DEFAULT_MNEMONIC, DEFAULT_SLOTS_IN_AN_EPOCH, DEFAULT_TEMPO_EPOCH_LENGTH, ForkChoice},
+    eth::{
+        EthApi, backend::db::SerializableState, miner::INSTANT_COALESCE_WINDOW,
+        pool::transactions::TransactionOrder,
+    },
 };
 use alloy_genesis::Genesis;
 use alloy_network::Network;
@@ -19,6 +22,7 @@ use futures::FutureExt;
 use rand_08::{SeedableRng, rngs::StdRng};
 use std::{
     net::IpAddr,
+    num::NonZeroU64,
     path::{Path, PathBuf},
     pin::Pin,
     str::FromStr,
@@ -87,6 +91,17 @@ pub struct NodeArgs {
     #[arg(long = "tempo.fee-payer", value_name = "ADDRESS")]
     pub tempo_fee_payer: Option<Address>,
 
+    /// Number of block heights in a Tempo consensus epoch. Only used on Tempo networks.
+    #[arg(long = "tempo.epoch-length", default_value_t = DEFAULT_TEMPO_EPOCH_LENGTH, value_name = "BLOCKS")]
+    pub tempo_epoch_length: NonZeroU64,
+
+    /// Development consensus seed for Tempo, as 32 bytes of hex.
+    ///
+    /// Defaults to a domain-separated hash of the dev-account mnemonic. Only used on Tempo
+    /// networks.
+    #[arg(long = "tempo.consensus-seed", value_name = "SEED")]
+    pub tempo_consensus_seed: Option<B256>,
+
     /// The EVM hardfork to use.
     ///
     /// Choose the hardfork by name, e.g. `prague`, `cancun`, `shanghai`, `paris`, `london`, etc...
@@ -102,6 +117,11 @@ pub struct NodeArgs {
     /// Block time in seconds for interval mining.
     #[arg(short, long, visible_alias = "blockTime", value_name = "SECONDS", value_parser = duration_from_secs_f64)]
     pub block_time: Option<Duration>,
+
+    /// Time in milliseconds to group ready transactions into one auto-mined block.
+    /// Defaults to 0 (no delay). Set a positive value to enable transaction coalescing.
+    #[arg(long, value_name = "MILLISECONDS", default_value_t = INSTANT_COALESCE_WINDOW.as_millis() as u64)]
+    pub transaction_coalescing_window: u64,
 
     /// Slots in an epoch
     #[arg(long, value_name = "SLOTS_IN_AN_EPOCH", default_value_t = DEFAULT_SLOTS_IN_AN_EPOCH)]
@@ -297,6 +317,9 @@ impl NodeArgs {
             .with_gas_price(self.evm.gas_price)
             .with_hardfork(hardfork)
             .with_blocktime(self.block_time)
+            .with_transaction_coalescing_window(Duration::from_millis(
+                self.transaction_coalescing_window,
+            ))
             .with_no_mining(self.no_mining)
             .with_mixed_mining(self.mixed_mining, self.block_time)
             .with_account_generator(self.account_generator())?
@@ -350,6 +373,8 @@ impl NodeArgs {
             // execution chain ID. Fork source discovery can refine an unresolved network later.
             .with_networks(networks)
             .with_tempo_fee_payer(self.tempo_fee_payer)
+            .with_tempo_epoch_length(self.tempo_epoch_length)
+            .with_tempo_consensus_seed(self.tempo_consensus_seed)
             .with_disable_default_create2_deployer(self.evm.disable_default_create2_deployer)
             .with_disable_pool_balance_checks(self.evm.disable_pool_balance_checks)
             .with_slots_in_an_epoch(self.slots_in_an_epoch)
@@ -664,6 +689,9 @@ pub struct AnvilEvmArgs {
     pub disable_block_gas_limit: bool,
 
     /// Enable the transaction gas limit check as imposed by EIP-7825 (Osaka hardfork).
+    ///
+    /// From Amsterdam, the cap always applies to regular gas only, and gas above it becomes the
+    /// EIP-8037 state gas reservoir.
     #[arg(long, visible_alias = "tx-gas-limit", help_heading = "Environment config")]
     pub enable_tx_gas_limit: bool,
 
@@ -703,6 +731,10 @@ pub struct AnvilEvmArgs {
     pub chain_id: Option<Chain>,
 
     /// Enable steps tracing used for debug calls returning geth-style traces
+    ///
+    /// Steps are recorded by replaying the transaction from its parent block's state, so they
+    /// are unavailable once that state is pruned or when loading a state dump created without
+    /// `--preserve-historical-states`.
     #[arg(long, visible_alias = "tracing")]
     pub steps_tracing: bool,
 
@@ -1639,5 +1671,79 @@ mod tests {
             let result = NodeArgs::try_parse_from(args);
             assert!(result.is_err(), "expected error when using {:?} without --fork-url", args[1]);
         }
+    }
+
+    #[test]
+    fn transaction_coalescing_window_cli() {
+        for (args, expected) in [
+            (vec!["anvil"], 0),
+            (vec!["anvil", "--transaction-coalescing-window", "0"], 0),
+            (vec!["anvil", "--transaction-coalescing-window", "20"], 20),
+        ] {
+            let config = NodeArgs::parse_from(args).into_node_config().unwrap();
+            assert_eq!(config.transaction_coalescing_window, Duration::from_millis(expected));
+        }
+        assert!(
+            NodeArgs::try_parse_from(["anvil", "--transaction-coalescing-window", "-1"]).is_err()
+        );
+    }
+
+    #[test]
+    fn tempo_consensus_arguments() {
+        for epoch_length in ["1", "21600", "18446744073709551615"] {
+            let config = NodeArgs::try_parse_from([
+                "anvil",
+                "--network",
+                "tempo",
+                "--tempo.epoch-length",
+                epoch_length,
+                "--tempo.consensus-seed",
+                "0x0101010101010101010101010101010101010101010101010101010101010101",
+            ])
+            .unwrap()
+            .into_node_config()
+            .unwrap();
+            assert_eq!(config.tempo_epoch_length.get(), epoch_length.parse::<u64>().unwrap());
+            assert_eq!(config.tempo_consensus_seed(), B256::repeat_byte(1));
+        }
+        for epoch_length in ["0", "-1", "18446744073709551616"] {
+            assert!(
+                NodeArgs::try_parse_from(["anvil", "--tempo.epoch-length", epoch_length,]).is_err()
+            );
+        }
+        for seed in ["0x01".to_owned(), "11".repeat(33), "zz".repeat(32)] {
+            assert!(NodeArgs::try_parse_from(["anvil", "--tempo.consensus-seed", &seed]).is_err());
+        }
+    }
+
+    #[test]
+    fn tempo_consensus_seed_uses_effective_mnemonic() {
+        let default = NodeArgs::parse_from(["anvil"]).into_node_config().unwrap();
+        assert_eq!(default.tempo_epoch_length, DEFAULT_TEMPO_EPOCH_LENGTH);
+        assert_eq!(default.tempo_consensus_seed(), NodeConfig::default().tempo_consensus_seed());
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let custom =
+            NodeArgs::parse_from(["anvil", "--mnemonic", mnemonic]).into_node_config().unwrap();
+        assert_ne!(custom.tempo_consensus_seed(), default.tempo_consensus_seed());
+        let seed = B256::repeat_byte(7);
+        let explicit = NodeArgs::parse_from([
+            "anvil",
+            "--mnemonic",
+            mnemonic,
+            "--tempo.consensus-seed",
+            &seed.to_string(),
+        ])
+        .into_node_config()
+        .unwrap();
+        assert_eq!(explicit.tempo_consensus_seed(), seed);
+        assert_eq!(explicit.genesis_accounts, custom.genesis_accounts);
+        let seeded = NodeArgs::parse_from(["anvil", "--mnemonic-seed-unsafe", "42"])
+            .into_node_config()
+            .unwrap();
+        let repeated = NodeArgs::parse_from(["anvil", "--mnemonic-seed-unsafe", "42"])
+            .into_node_config()
+            .unwrap();
+        assert_ne!(seeded.tempo_consensus_seed(), default.tempo_consensus_seed());
+        assert_eq!(seeded.tempo_consensus_seed(), repeated.tempo_consensus_seed());
     }
 }

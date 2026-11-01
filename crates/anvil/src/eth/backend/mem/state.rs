@@ -87,13 +87,53 @@ impl StateRootCache {
 
         for (address, account) in accounts {
             let dirty = self.dirty.entry(*address).or_default();
-            if account.account_state == AccountState::StorageCleared {
+            if account.account_state.is_storage_cleared() {
                 dirty.reset_storage = true;
             } else {
                 dirty.storage.extend(account.storage.keys().copied());
             }
         }
         true
+    }
+
+    /// Records every account and storage slot in `accounts` that differs from `previous`.
+    ///
+    /// `previous` must be the full state passed to the previous `root` call, and `accounts` must
+    /// be passed to the next one. Comparing complete states captures changes however they reached
+    /// `accounts`.
+    pub fn record_diff(
+        &mut self,
+        accounts: &AddressMap<DbAccount>,
+        previous: &AddressMap<DbAccount>,
+    ) {
+        for address in previous.keys().filter(|address| !accounts.contains_key(*address)) {
+            self.record_account(*address);
+        }
+        for (address, account) in accounts {
+            // New and recreated accounts have no storage trie left to update.
+            let Some(previous) = previous
+                .get(address)
+                .filter(|previous| previous.account_state != AccountState::NotExisting)
+            else {
+                if account.account_state != AccountState::NotExisting {
+                    self.dirty.entry(*address).or_default().reset_storage = true;
+                }
+                continue;
+            };
+            if previous.account_state != account.account_state || previous.info != account.info {
+                self.record_account(*address);
+            }
+            for (slot, value) in &account.storage {
+                if previous.storage.get(slot) != Some(value) {
+                    self.record_storage(*address, *slot);
+                }
+            }
+            for slot in previous.storage.keys() {
+                if !account.storage.contains_key(slot) {
+                    self.record_storage(*address, *slot);
+                }
+            }
+        }
     }
 
     /// Invalidates the trie after wholesale database replacement or clearing.
@@ -522,7 +562,7 @@ pub fn trie_account_rlp(info: &AccountInfo, storage: &U256Map<U256>) -> Vec<u8> 
 /// Returns the RLP for this account with an already computed storage root.
 fn trie_account_rlp_with_storage_root(info: &AccountInfo, storage_root: B256) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-    let list: [&dyn Encodable; 4] = [&info.nonce, &info.balance, &storage_root, &info.code_hash];
+    let list: [&dyn Encodable; 4] = [&info.nonce, &info.balance, &storage_root, &info.code_hash()];
 
     alloy_rlp::encode_list::<_, dyn Encodable>(&list, &mut out);
 
@@ -536,14 +576,12 @@ mod tests {
     #[test]
     fn canonical_roots_omit_zero_storage_and_non_existing_accounts() {
         let mut storage = U256Map::default();
-        storage.insert(U256::from(1), U256::ZERO);
+        storage.insert(U256::ONE, U256::ZERO);
         assert_eq!(storage_root(&storage), EMPTY_ROOT_HASH);
 
         let mut accounts = AddressMap::default();
-        accounts.insert(
-            alloy_primitives::Address::with_last_byte(1),
-            DbAccount { account_state: AccountState::NotExisting, ..Default::default() },
-        );
+        accounts
+            .insert(alloy_primitives::Address::with_last_byte(1), DbAccount::new_not_existing());
         assert_eq!(state_root(&accounts), EMPTY_ROOT_HASH);
         assert_eq!(StateRootCache::default().root(&accounts), EMPTY_ROOT_HASH);
     }
@@ -592,10 +630,7 @@ mod tests {
         check(&overlay, &full);
 
         // A deleted account must lose both its account leaf and its storage trie.
-        overlay.insert(
-            address,
-            DbAccount { account_state: AccountState::NotExisting, ..Default::default() },
-        );
+        overlay.insert(address, DbAccount::new_not_existing());
         full.remove(&address);
         check(&overlay, &full);
 
@@ -636,7 +671,7 @@ mod tests {
             )]);
             // Retain every overlay key when losing StorageCleared: the newly exposed base slot
             // still requires a rebuild. NotExisting likewise has no keys to lose.
-            let storage = if account_state == AccountState::StorageCleared {
+            let storage = if account_state.is_storage_cleared() {
                 previous[&address].storage.clone()
             } else {
                 U256Map::default()
@@ -693,5 +728,65 @@ mod tests {
             values.remove(&key);
             assert_eq!(trie.root(), rebuilt_root(&values));
         }
+    }
+
+    #[test]
+    fn diff_roots_match_full_rebuild() {
+        let [address, other, empty] = [1, 2, 3].map(alloy_primitives::Address::with_last_byte);
+        let [one, two, three] = [1u64, 2, 3].map(U256::from);
+        let account = DbAccount {
+            info: AccountInfo { balance: U256::from(100), ..Default::default() },
+            storage: [(one, U256::from(11)), (two, U256::from(22))].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut accounts = AddressMap::from_iter([(address, account.clone()), (other, account)]);
+        let mut cache = StateRootCache::default();
+        let mut previous = AddressMap::default();
+        let mut check = |accounts: &AddressMap<DbAccount>| {
+            cache.record_diff(accounts, &previous);
+            assert_eq!(cache.root(accounts), state_root(accounts));
+            previous.clone_from(accounts);
+        };
+        check(&accounts);
+
+        // Slot updates, additions, removals, and zero values.
+        let storage = &mut accounts.get_mut(&address).unwrap().storage;
+        storage.insert(one, U256::from(33));
+        storage.insert(three, U256::from(44));
+        storage.remove(&two);
+        check(&accounts);
+        accounts.get_mut(&address).unwrap().storage.insert(one, U256::ZERO);
+        check(&accounts);
+
+        // Account changes without storage changes.
+        accounts.get_mut(&address).unwrap().info.balance = U256::from(101);
+        check(&accounts);
+        accounts.get_mut(&address).unwrap().account_state = AccountState::Touched;
+        check(&accounts);
+        accounts.insert(
+            empty,
+            DbAccount { account_state: AccountState::Touched, ..Default::default() },
+        );
+        check(&accounts);
+        accounts.get_mut(&empty).unwrap().account_state = AccountState::NotExisting;
+        check(&accounts);
+
+        // A deleted account keeps cached storage, which must reappear when it is recreated.
+        accounts.get_mut(&other).unwrap().account_state = AccountState::NotExisting;
+        check(&accounts);
+        accounts.get_mut(&other).unwrap().storage.insert(three, U256::from(55));
+        check(&accounts);
+        accounts.get_mut(&other).unwrap().account_state = AccountState::Touched;
+        check(&accounts);
+
+        // Replaced storage drops every previous slot.
+        let replaced = accounts.get_mut(&other).unwrap();
+        replaced.account_state = AccountState::StorageCleared;
+        replaced.storage = [(two, U256::from(66))].into_iter().collect();
+        check(&accounts);
+
+        // Accounts missing from the next state lose their leaves.
+        accounts.remove(&address);
+        check(&accounts);
     }
 }

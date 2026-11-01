@@ -3,6 +3,7 @@ use crate::{
     eth::{
         backend::notifications::{ChainNotification, ChainNotifications},
         error::to_rpc_result,
+        tempo_consensus::TempoConsensusEvent,
     },
 };
 use alloy_consensus::{BlockHeader, TxReceipt};
@@ -17,9 +18,10 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{broadcast, mpsc::UnboundedReceiver};
 
 /// Listens for new blocks and matching logs emitted in that block
 pub struct LogsSubscription<N: Network> {
@@ -56,13 +58,32 @@ where
             if let Some(notification) = ready!(self.blocks.poll_next_unpin(cx)) {
                 let logs = match notification {
                     ChainNotification::Block(block) => {
-                        let b = self.storage.block(block.hash);
-                        let receipts = self.storage.receipts(block.hash);
-                        if let (Some(receipts), Some(block)) = (receipts, b) {
-                            filter_logs(block, receipts, &self.filter)
-                        } else {
+                        // Rule out nonmatching blocks before requiring data that may be pruned.
+                        if !self.filter.filter_block_range(block.header.number)
+                            || !self.filter.filter_block_hash(block.hash)
+                            || block.header.logs_bloom.is_zero()
+                            || self.filter.filter.as_ref().is_some_and(|filter| {
+                                !filter.matches_bloom(block.header.logs_bloom)
+                            })
+                        {
                             continue;
                         }
+                        let hash = block.hash;
+                        let (Some(block), Some(receipts)) =
+                            (self.storage.block(hash), self.storage.receipts(hash))
+                        else {
+                            tracing::warn!(target: "rpc::ws", ?hash, "Closing logs subscription because block data is unavailable");
+                            return Poll::Ready(None);
+                        };
+                        if block.body.transactions.len() != receipts.len()
+                            || (block.body.transactions.is_empty()
+                                && block.header.transactions_root()
+                                    != alloy_consensus::constants::EMPTY_ROOT_HASH)
+                        {
+                            tracing::warn!(target: "rpc::ws", ?hash, "Closing logs subscription because block data was pruned");
+                            return Poll::Ready(None);
+                        }
+                        filter_logs(block, receipts, &self.filter)
                     }
                     ChainNotification::RemovedLogs(logs) => {
                         filter_removed_logs(&logs, &self.filter)
@@ -115,6 +136,10 @@ pub enum EthSubscription<N: Network> {
     FullPendingTransactions(UnboundedReceiver<AnyRpcTransaction>, SubscriptionId),
     Syncing(Option<SubscriptionId>),
     TransactionReceipts(UnboundedReceiver<Vec<FoundryTxReceipt>>, SubscriptionId),
+    TempoConsensus(
+        Pin<Box<dyn Stream<Item = Arc<TempoConsensusEvent>> + Send + Sync>>,
+        SubscriptionId,
+    ),
 }
 
 impl<N: Network> std::fmt::Debug for EthSubscription<N> {
@@ -126,6 +151,7 @@ impl<N: Network> std::fmt::Debug for EthSubscription<N> {
             Self::FullPendingTransactions(..) => f.debug_tuple("FullPendingTransactions").finish(),
             Self::Syncing(_) => f.debug_tuple("Syncing").finish(),
             Self::TransactionReceipts(..) => f.debug_tuple("TransactionReceipts").finish(),
+            Self::TempoConsensus(..) => f.debug_tuple("TempoConsensus").finish(),
         }
     }
 }
@@ -189,7 +215,40 @@ where
                 });
                 Poll::Ready(res)
             }
+            Self::TempoConsensus(events, id) => {
+                let res = ready!(events.poll_next_unpin(cx)).map(|event| {
+                    let params = EthSubscriptionParams {
+                        subscription: id.clone(),
+                        result: to_rpc_result(&*event),
+                    };
+                    EthSubscriptionResponse {
+                        jsonrpc: Version::V2,
+                        method: "consensus_event",
+                        params,
+                    }
+                });
+                Poll::Ready(res)
+            }
         }
+    }
+
+    /// Owns the receiver directly so unsubscribe and disconnect release it without another event.
+    pub fn tempo_consensus(
+        events: broadcast::Receiver<Arc<TempoConsensusEvent>>,
+        id: SubscriptionId,
+    ) -> Self {
+        let events = futures::stream::unfold((events, id.clone()), |(mut events, id)| async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => return Some((event, (events, id))),
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(target: "rpc", %id, skipped, "Tempo consensus subscription lagged; recover retained blocks with consensus_getFinalization");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        });
+        Self::TempoConsensus(Box::pin(events), id)
     }
 }
 
@@ -272,4 +331,69 @@ pub fn filter_removed_logs(logs: &[Log], filter: &FilteredParams) -> Vec<Log> {
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::eth::{
+        backend::tempo_consensus::TempoFinalization, tempo_consensus::TempoCertifiedBlock,
+    };
+    use foundry_primitives::FoundryNetwork;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn tempo_subscription_wire_format_lag_and_cleanup() {
+        let events = broadcast::Sender::new(1);
+        let id = SubscriptionId::String("0x1234".to_owned());
+        let mut subscription =
+            EthSubscription::<FoundryNetwork>::tempo_consensus(events.subscribe(), id.clone());
+        assert_eq!(events.receiver_count(), 1);
+
+        let mut latest = None;
+        for view in 1..=2 {
+            let event = Arc::new(TempoConsensusEvent::Finalized {
+                block: TempoCertifiedBlock {
+                    finalization: TempoFinalization {
+                        epoch: 0,
+                        view,
+                        digest: B256::ZERO,
+                        certificate: Default::default(),
+                    },
+                    block: Default::default(),
+                },
+                seen: 1234,
+            });
+            events.send(event.clone()).unwrap();
+            latest = Some(event);
+        }
+
+        let expected_response = |event: &TempoConsensusEvent| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "consensus_event",
+                "params": { "subscription": id, "result": event },
+            })
+        };
+        let response = timeout(Duration::from_secs(1), subscription.next()).await.unwrap().unwrap();
+        assert_eq!(response, expected_response(latest.as_ref().unwrap()));
+        let mut next = subscription.next();
+        assert!(futures::poll!(&mut next).is_pending());
+
+        let mut event = latest.unwrap();
+        let TempoConsensusEvent::Finalized { block, .. } = Arc::make_mut(&mut event);
+        block.finalization.view = 3;
+        events.send(event.clone()).unwrap();
+
+        let response = timeout(Duration::from_secs(1), next).await.unwrap().unwrap();
+        assert_eq!(response, expected_response(&event));
+        drop(subscription);
+        assert_eq!(events.receiver_count(), 0);
+
+        let mut subscription =
+            EthSubscription::<FoundryNetwork>::tempo_consensus(events.subscribe(), id);
+        drop(events);
+        assert!(timeout(Duration::from_secs(1), subscription.next()).await.unwrap().is_none());
+    }
 }

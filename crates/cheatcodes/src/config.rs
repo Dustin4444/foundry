@@ -207,7 +207,12 @@ impl CheatsConfig {
     ///  - Returns an error if `url_or_alias` is a known alias but references an unresolved env var.
     ///  - Returns an error if `url_or_alias` is not an alias but does not start with a `http` or
     ///    `ws` `scheme` and is not a path to an existing file
+    ///  - Returns an error if network access is disabled.
     pub fn rpc_endpoint(&self, url_or_alias: &str) -> Result<ResolvedRpcEndpoint> {
+        // Every cheatcode that opens a connection to a URL or alias resolves it here.
+        if self.evm_opts.no_network {
+            return Err(fmt_err!("network access is disabled"));
+        }
         if let Some(endpoint) = self.rpc_endpoints.get(url_or_alias) {
             Ok(endpoint.clone().try_resolve())
         } else if let Some(builtin_url) = foundry_config::builtin_rpc_url(url_or_alias) {
@@ -289,8 +294,9 @@ fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use alloy_primitives::address;
+    use alloy_primitives::Address;
     use foundry_config::fs_permissions::PathPermission;
     use tempfile::TempDir;
 
@@ -363,7 +369,7 @@ mod tests {
 
     #[test]
     fn tracing_labels_override_legacy_labels() {
-        let address = address!("0x0000000000000000000000000000000000000001");
+        let address = Address::with_last_byte(1);
         let mut config = Config::default();
         config.labels.insert(address, "legacy".to_string());
         config.tracing.labels.insert(address, "canonical".to_string());

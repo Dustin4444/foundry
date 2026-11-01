@@ -102,6 +102,7 @@ impl<N: Network, B: ForkBlockEnv> ForkedDatabase<N, B> {
             accounts: db.accounts.read().clone(),
             storage: db.storage.read().clone(),
             block_hashes: db.block_hashes.read().clone(),
+            account_states: None,
         };
         ForkDbStateSnapshot { local: self.cache_db.clone(), state_snapshot }
     }
@@ -123,7 +124,7 @@ impl<N: Network, B: ForkBlockEnv> ForkedDatabase<N, B> {
             }
             let ForkDbStateSnapshot {
                 local,
-                state_snapshot: StateSnapshot { accounts, storage, block_hashes },
+                state_snapshot: StateSnapshot { accounts, storage, block_hashes, .. },
             } = state_snapshot;
             let db = self.inner().db();
             {
@@ -315,7 +316,7 @@ mod tests {
             assert_eq!(snapshot.storage_ref(address, slot).unwrap(), U256::ZERO);
             assert_eq!(snapshot.storage_ref(address, slot + U256::ONE).unwrap(), U256::ZERO);
 
-            if account_state == AccountState::StorageCleared {
+            if account_state.is_storage_cleared() {
                 snapshot
                     .local
                     .cache

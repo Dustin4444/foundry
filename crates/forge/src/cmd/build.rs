@@ -121,6 +121,7 @@ impl BuildArgs {
         let format_json = shell::is_json();
 
         let mut output = ProjectCompiler::new()
+            .allow_linked_libraries(config.allow_linked_libraries)
             .external_compilers(&config)
             .files(files)
             .selected_paths(selected_paths)
@@ -183,7 +184,7 @@ impl BuildArgs {
                             .lint
                             .exclude_lints
                             .iter()
-                            .filter_map(|s| forge_lint::sol::SolLint::try_from(s.as_str()).ok())
+                            .filter_map(|s| s.parse::<forge_lint::sol::SolLint>().ok())
                             .collect(),
                     )
                 })

@@ -3,7 +3,7 @@ use crate::{
     linter::{LateLintPass, LintContext},
     sol::{
         Severity, SolLint,
-        analysis::{for_each_lhs_var, is_contract_cast, loop_stmts},
+        analysis::{for_each_lhs_var, is_contract_cast, loop_stmts, write_target},
     },
 };
 use solar::{
@@ -119,7 +119,7 @@ impl<'gcx> LateLintPass<'gcx> for UnchangedStateVariables {
 
 fn has_assembly_or_unknown(stmt: &Stmt<'_>) -> bool {
     match &stmt.kind {
-        StmtKind::AssemblyBlock(_) | StmtKind::Switch(_) | StmtKind::Err(_) => true,
+        StmtKind::AssemblyBlock(..) | StmtKind::Switch(_) | StmtKind::Err(_) => true,
         StmtKind::Block(b) | StmtKind::UncheckedBlock(b) => {
             b.stmts.iter().any(has_assembly_or_unknown)
         }
@@ -148,12 +148,7 @@ impl<'gcx> hir::Visit<'gcx> for WriteCollector<'gcx> {
     }
 
     fn visit_expr(&mut self, expr: &'gcx Expr<'gcx>) -> ControlFlow<Self::BreakValue> {
-        let lvalue = match &expr.kind {
-            ExprKind::Assign(lhs, ..) | ExprKind::Delete(lhs) => Some(lhs),
-            ExprKind::Unary(op, inner) if op.kind.has_side_effects() => Some(inner),
-            _ => None,
-        };
-        if let Some(lvalue) = lvalue {
+        if let Some(lvalue) = write_target(expr) {
             for_each_lhs_var(self.gcx, lvalue, &mut |v| {
                 self.writes.insert(v);
             });

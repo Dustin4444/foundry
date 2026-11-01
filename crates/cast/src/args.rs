@@ -17,12 +17,12 @@ use alloy_eips::{Encodable2718, eip7702::SignedAuthorization};
 use alloy_ens::{NameOrAddress, ProviderEnsExt, namehash};
 use alloy_network::{BlockResponse, Ethereum, Network, eip2718::Decodable2718};
 use alloy_primitives::{
-    Address, B256, Bytes, I256, Keccak256, LogData, TxHash, U64, U256, b256, eip191_hash_message,
-    hex, keccak256,
+    Address, B256, Bytes, I256, Keccak256, LogData, Selector, TxHash, U64, U256, b256,
+    eip191_hash_message, hex, keccak256,
     utils::{ParseUnits, Unit},
 };
 use alloy_provider::Provider;
-use alloy_rlp::Decodable;
+use alloy_rlp::{decode_exact, encode};
 use alloy_rpc_types::BlockId;
 use clap::{CommandFactory, Parser};
 use clap_complete::generate;
@@ -254,9 +254,9 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::Conversion(ConversionSubcommand::FromRlp { value, as_int }) => {
             let bytes = hex::decode(stdin::unwrap_line(value)?).wrap_err("Could not decode hex")?;
             let value = if as_int {
-                U256::decode(&mut &bytes[..])?.to_string()
+                decode_exact::<U256>(&bytes)?.to_string()
             } else {
-                crate::rlp_converter::Item::decode(&mut &bytes[..])
+                decode_exact::<crate::rlp_converter::Item>(&bytes)
                     .wrap_err("Could not decode rlp")?
                     .to_string()
             };
@@ -267,7 +267,7 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let val =
                 serde_json::from_str(&value).unwrap_or_else(|_| serde_json::Value::String(value));
             let item = crate::rlp_converter::Item::value_to_item(&val)?;
-            print_scalar(format!("0x{}", hex::encode(alloy_rlp::encode(item))))?;
+            print_scalar(hex::encode_prefixed(encode(item)))?;
         }
         CastSubcommand::Conversion(ConversionSubcommand::ToHex(ToBaseArgs { value, base_in })) => {
             let value = stdin::unwrap_line(value)?;
@@ -382,8 +382,6 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             };
             print_scalar(out)?;
         }
-        // TODO(json): multi-line output (one line per topic + data field), needs structured object
-        // envelope
         CastSubcommand::Abi(AbiSubcommand::AbiEncodeEvent { sig, args }) => {
             let event = get_event(&sig)?;
             if event.inputs.len() != args.len() {
@@ -457,10 +455,25 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         CastSubcommand::Abi(AbiSubcommand::DecodeString { data }) => {
             print_tokens(&abi_decode_calldata("Any(string)", &data, true, true)?)?;
         }
-        CastSubcommand::Abi(AbiSubcommand::DecodeEvent { sig, data }) => {
+        CastSubcommand::Abi(AbiSubcommand::DecodeEvent { sig, data, topics }) => {
             let decoded_values = if let Some(event_sig) = sig {
                 let event = get_event(&event_sig)?;
-                abi_decode_event_data(&event, &hex::decode(data)?)?
+                let data = hex::decode(data)?;
+                if topics.is_empty() {
+                    abi_decode_event_data(&event, &data)?
+                } else {
+                    let decoded = event.decode_log_parts(topics, &data)?;
+                    let mut indexed = decoded.indexed.into_iter();
+                    let mut body = decoded.body.into_iter();
+                    event
+                        .inputs
+                        .iter()
+                        .map(|input| {
+                            if input.indexed { indexed.next() } else { body.next() }
+                                .expect("decoded event has a value for each input")
+                        })
+                        .collect()
+                }
             } else {
                 let data = strip_0x(&data);
                 let selector: B256 = data.get(..64).unwrap_or_default().parse()?;
@@ -1147,7 +1160,10 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
         // 4Byte
         CastSubcommand::Abi(AbiSubcommand::FourByte { selector }) => {
             let selector = stdin::unwrap_line(selector)?;
-            let sigs = decode_function_selector(selector).await?;
+            let sigs = with_local_first(
+                local_function_signature(selector).await?,
+                decode_function_selector(selector).await,
+            )?;
             if sigs.is_empty() {
                 eyre::bail!("No matching function signatures found for selector `{selector}`");
             }
@@ -1160,7 +1176,11 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
             let calldata = stdin::unwrap_line(calldata)?;
 
             if calldata.len() == 10 {
-                let sigs = decode_function_selector(calldata.parse()?).await?;
+                let selector = calldata.parse()?;
+                let sigs = with_local_first(
+                    local_function_signature(selector).await?,
+                    decode_function_selector(selector).await,
+                )?;
                 if sigs.is_empty() {
                     eyre::bail!("No matching function signatures found for calldata `{calldata}`");
                 }
@@ -1170,7 +1190,20 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 return Ok(());
             }
 
-            let sigs = decode_calldata(&calldata).await?;
+            let local = match strip_0x(&calldata).get(..8).map(str::parse::<Selector>) {
+                // Library types such as `L.S` parse as `uint8`, so a signature whose parsed form
+                // has another selector is used only if decoding with that form loses nothing.
+                Some(Ok(selector)) => local_function_signature(selector).await?.filter(|sig| {
+                    abi_decode_calldata(sig, &calldata, true, true).is_ok_and(|values| {
+                        get_func(sig).is_ok_and(|f| f.selector() == selector)
+                            || hex::decode(&calldata).is_ok_and(|data| {
+                                DynSolValue::Tuple(values).abi_encode_params() == data[4..]
+                            })
+                    })
+                }),
+                _ => None,
+            };
+            let sigs = with_local_first(local, decode_calldata(&calldata).await)?;
             for (i, sig) in sigs.iter().enumerate() {
                 let _ = sh_println!("{}) \"{sig}\"", i + 1);
             }
@@ -1189,7 +1222,12 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
 
         CastSubcommand::Abi(AbiSubcommand::FourByteEvent { topic }) => {
             let topic = stdin::unwrap_line(topic)?;
-            let sigs = decode_event_topic(topic).await?;
+            let local = SignaturesIdentifier::new(true)?.identify_event(topic).await;
+            // Drop cached signatures whose parsed form hashes to another topic.
+            let sigs = with_local_first(
+                local.filter(|event| event.selector() == topic).map(|event| event.signature()),
+                decode_event_topic(topic).await,
+            )?;
             if sigs.is_empty() {
                 eyre::bail!("No matching event signatures found for topic `{topic}`");
             }
@@ -1279,7 +1317,6 @@ pub async fn run_command(args: CastArgs) -> Result<()> {
                 value.wrapping_shr(bits.saturating_to())
             })?)?;
         }
-        // TODO(json): multi-line source code or directory expansion, needs structured envelope
         CastSubcommand::Misc(MiscSubcommand::Source {
             address,
             directory,
@@ -1478,7 +1515,7 @@ fn int_bound(s: &str, max: bool) -> Result<String> {
     let ty = DynSolType::parse(s).wrap_err("Invalid type, expected `(u)int<bit size>`")?;
     match ty {
         DynSolType::Int(n) => {
-            let max_value = (U256::MAX & U256::from(1).wrapping_shl(n - 1)) - U256::from(1);
+            let max_value = (U256::MAX & U256::ONE.wrapping_shl(n - 1)) - U256::ONE;
             if max {
                 Ok(max_value.to_string())
             } else {
@@ -1488,7 +1525,7 @@ fn int_bound(s: &str, max: bool) -> Result<String> {
         DynSolType::Uint(n) if max => {
             let mut max_value = U256::MAX;
             if n < 256 {
-                max_value &= U256::from(1).wrapping_shl(n).wrapping_sub(U256::from(1));
+                max_value &= U256::ONE.wrapping_shl(n).wrapping_sub(U256::ONE);
             }
             Ok(max_value.to_string())
         }
@@ -1588,13 +1625,13 @@ fn explorer_client(
 
 fn decode_raw_transaction<N: Network<TxEnvelope: SignerRecoverable + Serialize>>(
     tx: &str,
-) -> Result<String> {
+) -> Result<serde_json::Value> {
     let tx_hex = hex::decode(tx)?;
     let tx: N::TxEnvelope = Decodable2718::decode_2718(&mut tx_hex.as_slice())?;
     if let Ok(signer) = tx.recover_signer() {
-        Ok(serde_json::to_string_pretty(&Recovered::new_unchecked(tx, signer))?)
+        Ok(serde_json::to_value(Recovered::new_unchecked(tx, signer))?)
     } else {
-        Ok(serde_json::to_string_pretty(&tx)?)
+        Ok(serde_json::to_value(tx)?)
     }
 }
 
@@ -1673,6 +1710,33 @@ fn encode_event_topic_preimage(value: &DynSolValue, out: &mut Vec<u8>) {
     }
 }
 
+/// Returns the signature of a function selector from the local signatures cache, which
+/// `forge build` and trace decoding populate.
+///
+/// The stored text is returned as is: parsing it would turn library signatures such as
+/// `f(L.E)` into `f(uint8)`, which hashes to another selector.
+async fn local_function_signature(selector: Selector) -> Result<Option<String>> {
+    Ok(SignaturesIdentifier::new(true)?
+        .identify(&[SelectorKind::Function(selector)])
+        .await
+        .pop()
+        .flatten())
+}
+
+/// Lists a signature from the local cache first, followed by the other signatures found remotely.
+/// The cached signature alone is used when the remote lookup fails.
+fn with_local_first(local: Option<String>, remote: Result<Vec<String>>) -> Result<Vec<String>> {
+    match (local, remote) {
+        (Some(sig), Ok(mut sigs)) => {
+            sigs.retain(|remote| *remote != sig);
+            sigs.insert(0, sig);
+            Ok(sigs)
+        }
+        (Some(sig), Err(_)) => Ok(vec![sig]),
+        (None, remote) => remote,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1710,7 +1774,7 @@ mod tests {
         assert_eq!(
             topic(&DynSolValue::Array(vec![uint(1), uint(2)])),
             <sol_data::Array<sol_data::Uint<256>> as EventTopic>::encode_topic(&vec![
-                U256::from(1),
+                U256::ONE,
                 U256::from(2)
             ])
             .0,
@@ -1749,7 +1813,7 @@ mod tests {
                 DynSolValue::Array(vec![uint(2), uint(3)]),
             ])),
             <sol_data::Array<sol_data::Array<sol_data::Uint<256>>> as EventTopic>::encode_topic(
-                &vec![vec![U256::from(1)], vec![U256::from(2), U256::from(3)]]
+                &vec![vec![U256::ONE], vec![U256::from(2), U256::from(3)]]
             )
             .0,
         );

@@ -58,7 +58,7 @@ use foundry_evm::{
     opts::EvmOpts,
     traces::{InternalTraceMode, SparsedTraceArena, TraceContext, TraceRequirements},
 };
-use foundry_evm_networks::NetworkConfigs;
+use foundry_evm_networks::{NetworkConfigs, NetworkVariant};
 use futures::{StreamExt, TryFutureExt};
 use revm::{
     DatabaseRef,
@@ -72,7 +72,9 @@ use std::sync::Arc;
 use foundry_evm::core::evm::BaseEvmNetwork;
 
 #[cfg(feature = "monad")]
-use foundry_evm::core::evm::{BlockContext, ChainFor, MonadEvmNetwork};
+use foundry_evm::core::evm::{BlockContext, MonadEvmNetwork};
+#[cfg(feature = "monad")]
+use revm::context::TxEnv;
 
 #[cfg(feature = "optimism")]
 use foundry_evm::core::evm::OpEvmNetwork;
@@ -108,7 +110,11 @@ pub struct RunArgs {
     #[arg(long)]
     no_bal: bool,
 
-    /// Whether to replay system transactions.
+    /// Whether to attempt local replay of system transactions.
+    ///
+    /// Without this flag, ordinary block replay leaves out system transactions mined before the
+    /// target and warns about each one. Replay support depends on the selected network. Canonical
+    /// Monad system transactions are replayed regardless of this flag.
     #[arg(long, alias = "sys")]
     replay_system_txes: bool,
 
@@ -272,42 +278,36 @@ impl RunArgs {
 
     /// Replays the transaction locally with the EVM of its network.
     async fn replay(self, config: Box<Config>, evm_opts: EvmOpts) -> Result<()> {
-        if evm_opts.networks.is_tempo() {
-            return self
-                .run_with_evm(config, evm_opts, ExecutorBuilder::<TempoEvmNetwork>::new())
-                .await;
+        match evm_opts.networks.execution_network() {
+            NetworkVariant::Tempo => {
+                self.run_with_evm(config, evm_opts, ExecutorBuilder::<TempoEvmNetwork>::new()).await
+            }
+            #[cfg(feature = "base")]
+            NetworkVariant::Base => {
+                self.run_with_evm(config, evm_opts, ExecutorBuilder::<BaseEvmNetwork>::new()).await
+            }
+            #[cfg(feature = "monad")]
+            NetworkVariant::Monad => {
+                let target = self.fetch_target(&config).await?;
+                let mut run = self
+                    .prepare::<MonadEvmNetwork>(
+                        config,
+                        evm_opts,
+                        target,
+                        ExecutorBuilder::<MonadEvmNetwork>::new(),
+                    )
+                    .await?;
+                let result = run.execute_monad().await?;
+                run.finish(result).await
+            }
+            #[cfg(feature = "optimism")]
+            NetworkVariant::Optimism => {
+                self.run_with_evm(config, evm_opts, ExecutorBuilder::<OpEvmNetwork>::new()).await
+            }
+            NetworkVariant::Ethereum => {
+                self.run_with_evm(config, evm_opts, ExecutorBuilder::<EthEvmNetwork>::new()).await
+            }
         }
-
-        #[cfg(feature = "base")]
-        if evm_opts.networks.is_base() {
-            return self
-                .run_with_evm(config, evm_opts, ExecutorBuilder::<BaseEvmNetwork>::new())
-                .await;
-        }
-
-        #[cfg(feature = "monad")]
-        if evm_opts.networks.is_monad() {
-            let target = self.fetch_target(&config).await?;
-            let mut run = self
-                .prepare::<MonadEvmNetwork>(
-                    config,
-                    evm_opts,
-                    target,
-                    ExecutorBuilder::<MonadEvmNetwork>::new(),
-                )
-                .await?;
-            let result = run.execute_monad().await?;
-            return run.finish(result).await;
-        }
-
-        #[cfg(feature = "optimism")]
-        if evm_opts.networks.is_optimism() {
-            return self
-                .run_with_evm(config, evm_opts, ExecutorBuilder::<OpEvmNetwork>::new())
-                .await;
-        }
-
-        self.run_with_evm(config, evm_opts, ExecutorBuilder::<EthEvmNetwork>::new()).await
     }
 
     async fn run_with_evm<FEN: FoundryEvmNetwork>(
@@ -360,6 +360,7 @@ impl RunArgs {
             .await
             .wrap_err_with(|| format!("tx not found: {tx_hash:?}"))?
             .ok_or_else(|| eyre::eyre!("tx not found: {tx_hash:?}"))?;
+        ensure_requested_transaction(tx_hash, &tx)?;
         Ok(TargetFetch { tx, provider, compute_units_per_second })
     }
 
@@ -373,7 +374,7 @@ impl RunArgs {
         let tracing = self.configure_tracing(&mut config, &evm_opts);
         let with_local_artifacts = self.with_local_artifacts;
 
-        let endpoint_identity = evm_opts.discover_fork_endpoint().await?;
+        let endpoint_identity = evm_opts.fork_endpoint_identity().await?;
         let tx_inclusion = tx
             .block_hash_num()
             .ok_or_else(|| eyre::eyre!("tx may still be pending: {:?}", tx_hash))?;
@@ -419,6 +420,7 @@ impl RunArgs {
             arena: call_frame_to_arena(&frame, root_create_address),
             ignored: Default::default(),
             diagnostics: Default::default(),
+            debug_steps: None,
         };
         let result = TraceResult {
             success: receipt.status(),
@@ -450,10 +452,13 @@ impl RunArgs {
             &endpoint_identity,
             Some(transaction_block.header().timestamp()),
         );
-        let final_endpoint_identity = evm_opts.discover_fork_endpoint().await?;
+        let final_endpoint_identity = evm_opts.fork_endpoint_identity().await?;
         ensure_remote_trace_context_unchanged(&endpoint_identity, &final_endpoint_identity)?;
 
         let current_tx = provider.get_transaction_by_hash(tx_hash).await?;
+        if let Some(current_tx) = &current_tx {
+            ensure_requested_transaction(tx_hash, current_tx)?;
+        }
         ensure_remote_transaction_inclusion(
             tx_hash,
             tx_inclusion,
@@ -710,7 +715,7 @@ impl<FEN: FoundryEvmNetwork> PreparedRun<FEN> {
     fn prepare_target(&mut self) {
         let requirements = TraceRequirements::none()
             .with_calls(true)
-            .with_debug(self.args.debug)
+            .with_debug_recording(self.args.debug)
             .with_decode_internal(if self.tracing.decode_internal {
                 InternalTraceMode::Full
             } else {
@@ -801,6 +806,7 @@ impl<FEN: FoundryEvmNetwork> PreparedRun<FEN> {
         } else {
             let block_number = self.evm_env.block_env.number();
             let replay_system_txes = self.args.replay_system_txes;
+            let mut skipped_system_txes = Vec::new();
             self.for_each_prefix_transaction(target_index, |_, tx| {
                 if !is_system_transaction(tx) || replay_system_txes {
                     let tx_env = self.transaction_env(tx).wrap_err_with(|| {
@@ -812,9 +818,18 @@ impl<FEN: FoundryEvmNetwork> PreparedRun<FEN> {
                         )
                     })?;
                     replay.push((tx.tx_hash(), tx_env));
+                } else {
+                    skipped_system_txes.push(tx.tx_hash());
                 }
                 Ok(())
             })?;
+            if !skipped_system_txes.is_empty() {
+                sh_warn!(
+                    "the replay skips system transactions before the target, so their state \
+                     changes are missing: {skipped_system_txes:?}; `--replay-system-txes` \
+                     attempts local replay where supported; {REMOTE_TRACE_HINT}"
+                )?;
+            }
         }
         let result = self.executor.transact_with_ordinary_block_replay(
             self.evm_env.clone(),
@@ -919,14 +934,14 @@ impl PreparedRun<MonadEvmNetwork> {
         // Decode the target transaction before replaying the block: an envelope this build
         // can't decode should fail fast, not after paying for the entire prior-transaction
         // replay.
-        let target_tx_env = TxEnvFor::<MonadEvmNetwork>::from_any_rpc_transaction(&self.tx)?;
+        let target_tx_env = TxEnv::from_any_rpc_transaction(&self.tx)?;
         let target_index = self.target_index()?;
         self.prepare_target();
 
         let mut replay = Vec::new();
         self.for_each_prefix_transaction(target_index, |index, tx| {
-            let tx_env = TxEnvFor::<MonadEvmNetwork>::from_any_rpc_transaction(tx)?;
-            let chain_context: ChainFor<MonadEvmNetwork> = block_context.transaction(index);
+            let tx_env = TxEnv::from_any_rpc_transaction(tx)?;
+            let chain_context = block_context.transaction(index);
             replay.push((tx.tx_hash(), tx_env, chain_context));
             Ok(())
         })?;
@@ -1082,6 +1097,16 @@ fn ensure_remote_transaction_inclusion(
     Ok(())
 }
 
+/// Ensures the RPC answered `eth_getTransactionByHash` with the requested transaction.
+fn ensure_requested_transaction(requested: B256, tx: &AnyRpcTransaction) -> Result<()> {
+    let returned = tx.tx_hash();
+    eyre::ensure!(
+        returned == requested,
+        "RPC returned transaction {returned:?} for requested {requested:?}"
+    );
+    Ok(())
+}
+
 const fn parent_beacon_block_root_for_network(
     networks: NetworkConfigs,
     spec_id: SpecId,
@@ -1194,12 +1219,31 @@ impl figment::Provider for RunArgs {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
-    use alloy_primitives::address;
+
+    #[test]
+    fn http_wrapped_method_not_found_has_trace_guidance() {
+        let error = alloy_transport::TransportErrorKind::http_error(
+            403,
+            r#"{"jsonrpc":"2.0","error":{"code":-32601,"message":"method disabled"}}"#.into(),
+        );
+        let error = call_tracer_frame(
+            Err(error),
+            "debug_traceTransaction",
+            "replay locally",
+            "this transaction",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the RPC endpoint does not support `debug_traceTransaction` (method not found); use a node with the `debug` namespace enabled (e.g. a local anvil/reth or an archive endpoint), or replay locally"
+        );
+    }
 
     #[test]
     fn parses_legacy_short_label_alias() {
-        let address = address!("0x0000000000000000000000000000000000000001");
+        let address = Address::with_last_byte(1);
         let label = format!("{address}:alice");
         let args = RunArgs::parse_from(["cast run", "0x00", "-l", &label]);
 
